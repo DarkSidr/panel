@@ -5,6 +5,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -247,9 +248,11 @@ real_ip_header proxy_protocol;
     web += f'''server {{ listen 127.0.0.1:9443 ssl proxy_protocol;
 
 server_name {' '.join(site_names)}; {cert}
+if ($host != $ssl_server_name) {{ return 421; }}
 root /var/www/proxy-site; location / {{ try_files $uri $uri/ =404; }} }}
 '''
     web += f'''server {{ listen 127.0.0.1:7443 ssl proxy_protocol; server_name {panel}; {cert}
+if ($host != $ssl_server_name) {{ return 421; }}
 location ^~ {c['panel_path']} {{
 proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $connection_upgrade;
@@ -604,7 +607,23 @@ def healthcheck(c):
                     raise ValueError('Unexpected HTML response')
         except Exception:
             raise ValueError('HTTPS health check failed for ' + label + '; check DNS, certificate and nginx') from None
-    print('Health checks passed: services, firewall, Xray, site HTTPS and panel HTTPS.')
+    # Shared certificates let HTTP/2 clients reuse one TLS connection for both hosts.
+    # The stream router picked its backend using the original SNI: reject a different
+    # authority with 421 so the client reconnects with that authority's own SNI.
+    for sni, host, path in [(c['panel'], c['site'], '/'),
+                            (c['site'], c['panel'], c['panel_path'])]:
+        connection = http.client.HTTPSConnection(sni, timeout=15)
+        try:
+            connection.request('GET', path, headers={'Host': host})
+            response = connection.getresponse()
+            if response.status != 421:
+                raise ValueError('Missing misdirected-request response')
+            response.read()
+        except Exception:
+            raise ValueError('HTTPS routing check failed; regenerate nginx with proxyctl.py sync') from None
+        finally:
+            connection.close()
+    print('Health checks passed: services, firewall, Xray, HTTPS and cross-domain routing.')
 
 
 def unit(name, text):

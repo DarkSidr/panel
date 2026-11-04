@@ -19,6 +19,8 @@ class HealthCheckTests(unittest.TestCase):
         self.request = self.enterContext(patch.object(m.urllib.request, 'urlopen',
                                                     side_effect=lambda *a, **k: html_response()))
         self.output = self.enterContext(patch('builtins.print'))
+        self.connection = self.enterContext(patch.object(m.http.client, 'HTTPSConnection'))
+        self.connection.return_value.getresponse.return_value.status = 421
 
     def test_healthy_server_checks_both_https_hosts(self):
         m.healthcheck(C)
@@ -58,6 +60,13 @@ class HealthCheckTests(unittest.TestCase):
     def test_certificate_or_http_failure_does_not_expose_panel_path(self):
         self.request.side_effect = [html_response(), OSError('failed URL ' + C['panel_path'])]
         with self.assertRaisesRegex(ValueError, 'HTTPS health check failed for panel') as error:
+            m.healthcheck(C)
+        self.assertNotIn(C['panel_path'], str(error.exception))
+        self.output.assert_not_called()
+
+    def test_reused_connection_must_be_rejected_to_avoid_cross_domain_404(self):
+        self.connection.return_value.getresponse.return_value.status = 404
+        with self.assertRaisesRegex(ValueError, 'HTTPS routing check failed') as error:
             m.healthcheck(C)
         self.assertNotIn(C['panel_path'], str(error.exception))
         self.output.assert_not_called()

@@ -30,6 +30,7 @@ sh /tmp/proxy-install.sh install --site example.org --panel panel.example.org --
 cat /etc/proxy-stack/credentials
 ```
 
+Открывайте полный `URL` из этого файла: корень домена панели возвращает 404.
 После входа включите 2FA в настройках панели.
 
 ## Добавление подключений
