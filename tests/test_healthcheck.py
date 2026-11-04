@@ -25,7 +25,8 @@ class HealthCheckTests(unittest.TestCase):
     def test_healthy_server_checks_both_https_hosts(self):
         m.healthcheck(C)
         self.assertEqual([call.args[0] for call in self.request.call_args_list],
-                         ['https://' + C['site'] + '/', 'https://' + C['panel'] + C['panel_path']])
+                         ['https://' + C['site'] + '/', 'https://' + C['panel'] + '/',
+                          'https://' + C['panel'] + C['panel_path']])
         self.output.assert_called_once()
 
     def test_running_panel_with_stopped_xray_is_not_healthy(self):
@@ -58,10 +59,17 @@ class HealthCheckTests(unittest.TestCase):
         self.output.assert_not_called()
 
     def test_certificate_or_http_failure_does_not_expose_panel_path(self):
-        self.request.side_effect = [html_response(), OSError('failed URL ' + C['panel_path'])]
+        self.request.side_effect = [html_response(), html_response(),
+                                    OSError('failed URL ' + C['panel_path'])]
         with self.assertRaisesRegex(ValueError, 'HTTPS health check failed for panel') as error:
             m.healthcheck(C)
         self.assertNotIn(C['panel_path'], str(error.exception))
+        self.output.assert_not_called()
+
+    def test_panel_root_must_serve_the_same_cover_site(self):
+        self.request.side_effect = [html_response(), html_response(b'<html>Wrong page</html>')]
+        with self.assertRaisesRegex(ValueError, 'HTTPS health check failed for panel cover'):
+            m.healthcheck(C)
         self.output.assert_not_called()
 
     def test_reused_connection_must_be_rejected_to_avoid_cross_domain_404(self):

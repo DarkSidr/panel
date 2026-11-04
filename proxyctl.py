@@ -233,6 +233,10 @@ ssl_certificate_key /etc/letsencrypt/live/proxy-stack/privkey.pem;
 ssl_protocols TLSv1.2 TLSv1.3;
 http2 on;
 '''
+    cover = '''root /var/www/proxy-site;
+index index.html;
+location / { try_files $uri $uri/ =404; add_header Cache-Control "no-store" always; }
+'''
     web = '''http {
 include /etc/nginx/mime.types;
 default_type application/octet-stream;
@@ -249,7 +253,7 @@ real_ip_header proxy_protocol;
 
 server_name {' '.join(site_names)}; {cert}
 if ($host != $ssl_server_name) {{ return 421; }}
-root /var/www/proxy-site; location / {{ try_files $uri $uri/ =404; }} }}
+{cover} }}
 '''
     web += f'''server {{ listen 127.0.0.1:7443 ssl proxy_protocol; server_name {panel}; {cert}
 if ($host != $ssl_server_name) {{ return 421; }}
@@ -281,7 +285,7 @@ proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_
 proxy_buffering off; proxy_request_buffering off; proxy_read_timeout 1h;
 proxy_pass http://127.0.0.1:{r['port']};\n'''
         web += '}\n'
-    return prefix + stream + web + 'location / { return 404; }\n}\n}\n'
+    return prefix + stream + web + cover + '}\n}\n'
 
 
 def firewall(c, rs):
@@ -598,13 +602,20 @@ def healthcheck(c):
     binary = '/usr/local/x-ui/bin/xray-linux-' + {'x86_64':'amd64', 'aarch64':'arm64'}[platform.machine()]
     run(binary, 'run', '-test', '-config', '/usr/local/x-ui/bin/config.json',
         env=dict(os.environ, XRAY_LOCATION_ASSET='/usr/local/x-ui/bin'))
+    cover_body = None
     for label, url in [('site', 'https://' + c['site'] + '/'),
+                       ('panel cover', 'https://' + c['panel'] + '/'),
                        ('panel', 'https://' + c['panel'] + c['panel_path'])]:
         try:
             # urlopen verifies the certificate chain and hostname. Never log the secret path.
             with urllib.request.urlopen(url, timeout=15) as response:
-                if response.status != 200 or b'<html' not in response.read(65536).lower():
+                body = response.read(65536)
+                if response.status != 200 or b'<html' not in body.lower():
                     raise ValueError('Unexpected HTML response')
+                if label == 'site':
+                    cover_body = body
+                elif label == 'panel cover' and body != cover_body:
+                    raise ValueError('Panel root does not serve the cover site')
         except Exception:
             raise ValueError('HTTPS health check failed for ' + label + '; check DNS, certificate and nginx') from None
     # Shared certificates let HTTP/2 clients reuse one TLS connection for both hosts.
