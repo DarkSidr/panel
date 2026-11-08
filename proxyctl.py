@@ -192,14 +192,17 @@ proxy_set_header X-Forwarded-Proto https;'''
 
 def render(c, rs, tls=True):
     site, panel = domain(c['site']), domain(c['panel'])
+    ipv6 = not c.get('ipv6_disabled', False)
+    http6 = ' listen [::]:80;' if ipv6 else ''
+    default6 = ' listen [::]:80 default_server;' if ipv6 else ''
     site_names = sorted({site, *c.get('reality_names', [])})
     for name in site_names:
         domain(name)
     http_names = ' '.join([panel]+site_names)
-    challenge = f'''server {{ listen 80; listen [::]:80; server_name {http_names};
+    challenge = f'''server {{ listen 80;{http6} server_name {http_names};
 location ^~ /.well-known/acme-challenge/ {{ root /var/www/proxy-acme; }}
 location / {{ return 301 https://$host$request_uri; }} }}
-server {{ listen 80 default_server; listen [::]:80 default_server; server_name _; return 444; }}'''
+server {{ listen 80 default_server;{default6} server_name _; return 444; }}'''
     prefix = '''include /etc/nginx/modules-enabled/*.conf;
 user www-data;
 worker_processes auto;
@@ -223,11 +226,12 @@ events { worker_connections 4096; }
         stream += f'map $ssl_preread_server_name $backend_{public} {{\n'
         stream += ''.join(f'{name} 127.0.0.1:{upstream};\n' for name,upstream in sorted(defaults.items()))
         stream += 'default 127.0.0.1:10443;\n}\n'
-        stream += f'server {{ listen {public}; listen [::]:{public}; ssl_preread on; proxy_protocol on; proxy_pass $backend_{public}; proxy_timeout 1h; }}\n'
+        tcp6 = f' listen [::]:{public};' if ipv6 else ''
+        stream += f'server {{ listen {public};{tcp6} ssl_preread on; proxy_protocol on; proxy_pass $backend_{public}; proxy_timeout 1h; }}\n'
     for r in rs:
         if r['kind'] == 'udp':
             # Public IP binds avoid collision with loopback inbound at the same port.
-            listens = ''.join(f"listen {'['+ip+']' if ':' in ip else ip}:{r.get('public_port', r['port'])} udp reuseport;\n" for ip in c['public_ips'])
+            listens = ''.join(f"listen {'['+ip+']' if ':' in ip else ip}:{r.get('public_port', r['port'])} udp reuseport;\n" for ip in c['public_ips'] if ipv6 or ':' not in ip)
             stream += f"server {{ {listens} proxy_pass 127.0.0.1:{r['port']}; proxy_timeout 120s; }}\n"
     stream += '}\n'
     cert = f'''ssl_certificate /etc/letsencrypt/live/proxy-stack/fullchain.pem;
@@ -847,6 +851,30 @@ def bootstrap_db(c, username, password):
     write(CONF / 'api-token', match[1]+'\n')
 
 
+def configure_ipv4():
+    """Persist host IPv4-only policy, including network managers that enable IPv6 at boot."""
+    path = '/etc/sysctl.d/99-proxy-stack-ipv4.conf'
+    write(path, '# Managed by proxy-stack; applies to existing and future interfaces.\n'
+          'net.ipv6.conf.all.disable_ipv6 = 1\n'
+          'net.ipv6.conf.default.disable_ipv6 = 1\n'
+          'net.ipv6.conf.*.disable_ipv6 = 1\n', 0o644)
+    unit('proxy-stack-ipv4.service', '''[Unit]
+Description=Disable host IPv6 after network configuration
+Wants=network-online.target
+After=network-online.target
+Before=nginx.service x-ui.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/sysctl -p /etc/sysctl.d/99-proxy-stack-ipv4.conf
+[Install]
+WantedBy=multi-user.target
+''')
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', 'proxy-stack-ipv4.service')
+    run('systemctl', 'restart', 'proxy-stack-ipv4.service')
+
+
 def preflight(args, required_version='13'):
     osinfo = platform.freedesktop_os_release()
     if osinfo.get('ID') != 'debian' or osinfo.get('VERSION_ID') != required_version:
@@ -870,16 +898,17 @@ def preflight(args, required_version='13'):
         ssh_ports = sorted(set(ssh_ports + [port(os.environ['SSH_CONNECTION'].split()[3])]))
     ips = json.loads(run('ip', '-j', 'address', 'show', 'scope', 'global').stdout)
     local = {a['local'] for i in ips for a in i['addr_info'] if 'local' in a}
-    public = sorted(ip for ip in local if ipaddress.ip_address(ip).is_global)
+    public = sorted(ip for ip in local if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
     for name in [args.site, args.panel]+args.reality_name:
         addresses = {x[4][0] for x in socket.getaddrinfo(name, 443, type=socket.SOCK_STREAM)}
+        if any(ipaddress.ip_address(ip).version == 6 for ip in addresses):
+            raise ValueError(f'{name}: remove AAAA records before this IPv4-only installation')
         if not addresses or not addresses.issubset(set(public)):
-            raise ValueError(f'{name}: every A/AAAA must point directly to an address on this VPS; no CDN/NAT')
+            raise ValueError(f'{name}: every A record must point directly to an IPv4 address on this VPS; no CDN/NAT')
     for p in RESERVED | {10443,9444}:
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-            with socket.socket(socket.AF_INET6, kind) as sock:
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-                sock.bind(('::',p))
+            with socket.socket(socket.AF_INET, kind) as sock:
+                sock.bind(('0.0.0.0',p))
     return ssh_ports, public
 
 
@@ -922,12 +951,13 @@ def install(args):
     c = {'site': args.site, 'panel': args.panel, 'email': args.email, 'reality_names':args.reality_name, 'auto_setup':not args.manual_inbounds,
          'panel_path': '/'+secrets.token_hex(16)+'/',
          'sub_paths': {k:'/'+secrets.token_hex(16)+'/' for k in ('base','json','clash')},
-         'ssh_ports':ssh_ports, 'public_ips':ips, 'tag':r['tag_name'], 'stage':'preparing',
+         'ssh_ports':ssh_ports, 'public_ips':ips, 'ipv6_disabled':True, 'tag':r['tag_name'], 'stage':'preparing',
          'theme':args.theme or secrets.choice(['astronomy','plants','photography','travel','cooking'])}
     save(CONF / 'config.json', c)
     try:
         run('apt-get', 'update')
-        run('apt-get', 'install', '-y', 'nginx', 'libnginx-mod-stream', 'certbot', 'nftables', 'ca-certificates', 'curl', 'logrotate')
+        run('apt-get', 'install', '-y', 'nginx', 'libnginx-mod-stream', 'certbot', 'nftables', 'ca-certificates', 'curl', 'logrotate', 'procps')
+        configure_ipv4()
         shutil.copytree(Path(__file__).parent, APP, ignore=shutil.ignore_patterns('__pycache__','.git'))
         shutil.copy2(NGINX, BASE / 'nginx.original')
         Path('/var/www/proxy-site').mkdir(mode=0o755)
