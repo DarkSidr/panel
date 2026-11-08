@@ -36,6 +36,14 @@ class HealthCheckTests(unittest.TestCase):
         self.request.assert_not_called()
         self.output.assert_not_called()
 
+    def test_configured_but_stopped_awg_is_not_healthy(self):
+        self.api.return_value = {'xray': {'state': 'running'},
+                                 'amneziawg': {'configured': True, 'running': False}}
+        with self.assertRaisesRegex(ValueError, 'AmneziaWG is configured but not running'):
+            m.healthcheck(C)
+        self.request.assert_not_called()
+        self.output.assert_not_called()
+
     def test_inactive_service_fails_readiness(self):
         self.run.side_effect = RuntimeError('inactive service')
         with self.assertRaisesRegex(RuntimeError, 'inactive service'):

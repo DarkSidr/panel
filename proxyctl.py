@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Debian 13 proxy appliance. No third-party Python dependencies."""
 import argparse
+import base64
 import contextlib
 import datetime
 import fcntl
@@ -22,6 +23,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import uuid
 
 BASE = Path('/var/lib/proxy-stack')
 CONF = Path('/etc/proxy-stack')
@@ -350,8 +352,8 @@ def json_object(value):
     return json.loads(value or '{}') if isinstance(value, str) else (value or {})
 
 
-def panel_api(c, path, body=None):
-    token = (CONF / 'api-token').read_text().strip()
+def panel_api(c, path, body=None, *, token=None):
+    token = token or (CONF / 'api-token').read_text().strip()
     headers = {'Host': c['panel'], 'Authorization': 'Bearer ' + token}
     if body is not None:
         headers['Content-Type'] = 'application/json'
@@ -363,6 +365,26 @@ def panel_api(c, path, body=None):
         # API validation messages can echo supplied settings; do not log secrets.
         raise ValueError('Panel API rejected operation: ' + path.split('/')[0])
     return result.get('obj')
+
+
+@contextlib.contextmanager
+def provisioning_token(c):
+    """Hosts writes need admin; keep the recurring sync token at node-sync scope."""
+    name = 'proxy-stack-provision'
+    output = run(BIN, 'setting', '-tokenName', name, '-tokenScope', 'admin', '-getApiToken').stdout
+    match = re.search(r'^apiToken:\s*(\S+)\s*$', output, re.M)
+    if not match:
+        raise ValueError('Cannot create the temporary provisioning token')
+    token = match[1]
+    try:
+        yield token
+    finally:
+        try:
+            rows = panel_api(c, 'setting/apiTokens', token=token)
+            row = next(r for r in rows if r.get('name') == name and r.get('scope') == 'admin')
+            panel_api(c, 'setting/apiTokens/delete/' + str(row['id']), {'expectedScope': 'admin'}, token=token)
+        except Exception:
+            raise ValueError('Cannot revoke proxy-stack-provision token; remove this token in panel settings before retrying') from None
 
 
 def x25519_pair(private=None):
@@ -382,6 +404,16 @@ def x25519_pair(private=None):
 def tcp_port_free(number):
     try:
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.bind(('::', number))
+        return True
+    except OSError:
+        return False
+
+
+def udp_port_free(number):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             sock.bind(('::', number))
         return True
@@ -558,6 +590,142 @@ def set_auto_setup(c, enabled):
     print('Automatic setup of new VLESS inbounds:', 'enabled' if enabled else 'disabled')
 
 
+DEFAULT_PROFILES = (
+    ('xhttp-reality', 'VLESS XHTTP + REALITY', 'vless', 'xhttp', 'reality'),
+    ('tcp-reality', 'VLESS TCP + REALITY', 'vless', 'tcp', 'reality'),
+    ('grpc-reality', 'VLESS gRPC + REALITY', 'vless', 'grpc', 'reality'),
+    ('xhttp-tls', 'VLESS XHTTP + TLS', 'vless', 'xhttp', 'tls'),
+    ('ws-tls', 'VLESS WebSocket + TLS', 'vless', 'ws', 'tls'),
+    ('trojan-ws-tls', 'Trojan WebSocket + TLS', 'trojan', 'ws', 'tls'),
+    ('awg31', 'AmneziaWG 3.1', 'amneziawg', None, None),
+)
+
+
+def default_awg_server():
+    # Same userspace architecture/MTU and header-protection mode as the working
+    # reference VPS. Each installation gets new secrets and obfuscation lengths.
+    jmin = 40 + secrets.randbelow(50)
+    s1, s2 = 32 + secrets.randbelow(97), 32 + secrets.randbelow(97)
+    while s1 + 56 == s2:
+        s2 = 32 + secrets.randbelow(97)
+    return {
+        'kernelMode': False, 'subnetIp': '10.8.1.0', 'subnetCidr': 24, 'mtu': 1380,
+        'primaryDns': '8.8.8.8', 'secondaryDns': '8.8.4.4',
+        'jc': 3 + secrets.randbelow(4), 'jmin': jmin,
+        'jmax': jmin + 50 + secrets.randbelow(151),
+        's1': s1, 's2': s2, 's3': 12 + secrets.randbelow(44),
+        's4': 12 + secrets.randbelow(16),
+        'h1': '1', 'h2': '2', 'h3': '3', 'h4': '4',
+        'headerProtectionKey': base64.b64encode(secrets.token_bytes(32)).decode(),
+        'contentPaddingAddition': '14-52', 'rekeyAfterTime': '100-140',
+        'rekeyTimeout': '3-7', 'rejectAfterTime': '189-233',
+        'keepaliveTimeout': '11-15', 'maxHandshakeAttempts': '17-32',
+        'randomTrailers': True, 'disableCookies': True,
+    }
+
+
+def plan_default_inbounds(c, existing):
+    """Plan the complete set before making any API writes."""
+    items = list(existing)
+    planned = []
+    used = {port(i['port']) for i in existing if not i.get('nodeId')}
+    used |= RESERVED | set(c['ssh_ports'])
+    for index, (key, label, protocol, network, security) in enumerate(DEFAULT_PROFILES):
+        tag = 'proxy-default-' + key
+        if any(i.get('tag') == tag for i in existing):
+            raise ValueError('Default inbound tag already exists without a saved seed plan: ' + tag)
+        client = {'email': 'owner-' + key + '-' + secrets.token_hex(4),
+                  'enable': True, 'subId': secrets.token_hex(16),
+                  'totalGB': 0, 'expiryTime': 0, 'limitIp': 0}
+        i = {'id': -(index + 1), 'tag': tag, 'remark': label, 'enable': True,
+             'listen': '127.0.0.1', 'protocol': protocol, 'expiryTime': 0, 'total': 0,
+             'sniffing': {'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'routeOnly': True}}
+        if protocol == 'amneziawg':
+            backend = next((p for p in range(51820, 51920) if p not in used and udp_port_free(p)), None)
+            if backend is None or not udp_port_free(443):
+                raise ValueError('Default AWG requires a free local UDP port and public UDP 443')
+            # The panel generates the server identity; client keys use the same
+            # X25519 primitive with WireGuard's standard base64 encoding.
+            private, public = x25519_pair()
+            client.update(privateKey=base64.b64encode(base64.urlsafe_b64decode(private + '=')).decode(),
+                          publicKey=base64.b64encode(base64.urlsafe_b64decode(public + '=')).decode(),
+                          preSharedKey=base64.b64encode(secrets.token_bytes(32)).decode(),
+                          allowedIPs=['10.8.1.2/32'], keepAlive='20-30')
+            i.update(port=backend, settings={'server': default_awg_server(), 'clients': [client]},
+                     streamSettings={}, sniffing={})
+        else:
+            i['port'] = 443  # Planner chooses an available loopback backend.
+            client.update(id=str(uuid.uuid4()), flow='xtls-rprx-vision' if network == 'tcp' else '')
+            if protocol == 'trojan':
+                client['password'] = secrets.token_urlsafe(32)
+            i.update(settings={'clients': [client], **({'decryption': 'none', 'encryption': 'none'} if protocol == 'vless' else {})},
+                     streamSettings={'network': network})
+            i = prepare_inbound(i, items + [i], c, security)
+            backend = i['port']
+        used.add(backend)
+        planned.append(i)
+        items.append(i)
+    return planned
+
+
+def seed_default_inbounds(c):
+    """Explicit installation step; retries reuse the saved plan and never rotate keys."""
+    path = BASE / 'default-inbounds.json'
+    existing = panel_api(c, 'inbounds/list')
+    if path.exists():
+        state = json.loads(path.read_text())
+    else:
+        state = {'complete': False, 'inbounds': plan_default_inbounds(c, existing)}
+        save(path, state)  # Persist identities before the first POST (including timeouts).
+    seen_path = BASE / 'auto-setup.json'
+    seen = json.loads(seen_path.read_text()) if seen_path.exists() else {'seen': {}}
+    for i in state['inbounds']:
+        matches = [x for x in existing if x.get('tag') == i['tag']]
+        if len(matches) > 1:
+            raise ValueError('Duplicate default inbound tag: ' + i['tag'])
+        if not matches:
+            if state['complete']:
+                raise ValueError('A default inbound was removed; refusing to recreate it automatically')
+            body = {k: v for k, v in i.items() if k != 'id'}
+            created = panel_api(c, 'inbounds/add', body)
+            if not isinstance(created, dict) or not created.get('id'):
+                raise ValueError('Panel did not return the new inbound ID')
+            existing.append(created)
+        else:
+            created = matches[0]
+        seen['seen'][str(created['id'])] = 'default'
+        save(seen_path, seen)
+        if i['protocol'] == 'amneziawg':
+            hosts = panel_api(c, 'hosts/list')
+            attached = [h for h in hosts if created['id'] in h.get('inboundIds', [])]
+            if not attached:
+                with provisioning_token(c) as token:
+                    panel_api(c, 'hosts/bulk/add', {'remark': i['remark'], 'inboundIds': [created['id']],
+                              'hosts': [c['panel']], 'port': 443, 'security': 'same',
+                              'isDisabled': False, 'isHidden': False}, token=token)
+    # Validate what the panel actually stored, including normalized AWG settings.
+    actual = panel_api(c, 'inbounds/list')
+    defaults = [next(x for x in actual if x.get('tag') == i['tag']) for i in state['inbounds']]
+    for i in defaults:
+        settings = json_object(i.get('settings'))
+        if not i.get('enable') or not any(x.get('enable') for x in settings.get('clients', [])):
+            raise ValueError('A default inbound has no enabled client: ' + i['tag'])
+        if i['protocol'] == 'amneziawg':
+            server = settings.get('server', {})
+            if not all(server.get(k) for k in ('privateKey', 'publicKey', 'headerProtectionKey', 'randomTrailers', 'disableCookies')):
+                raise ValueError('Panel did not preserve the required AWG 3.1 parameters')
+    defaults = attach_awg_hosts(defaults, panel_api(c, 'hosts/list'))
+    routes(defaults, c)
+    state['complete'] = True
+    save(path, state)
+    lines = []
+    for i in defaults:
+        client = json_object(i['settings'])['clients'][0]
+        lines.append(i['remark'] + '\nhttps://' + c['panel'] + c['sub_paths']['base'] + client['subId'])
+    write(CONF / 'default-subscriptions', '\n\n'.join(lines) + '\n')
+    print('Default connections ready:', len(defaults), '(see panel and /etc/proxy-stack/default-subscriptions)')
+
+
 
 def sync(c):
     token = (CONF / 'api-token').read_text().strip()
@@ -599,6 +767,9 @@ def healthcheck(c):
     status = panel_api(c, 'server/status')
     if not isinstance(status, dict) or status.get('xray', {}).get('state') != 'running':
         raise ValueError('Xray is not running; check journalctl -u x-ui')
+    awg = status.get('amneziawg', {})
+    if awg.get('configured') and not awg.get('running'):
+        raise ValueError('AmneziaWG is configured but not running; check AWG logs in panel')
     binary = '/usr/local/x-ui/bin/xray-linux-' + {'x86_64':'amd64', 'aarch64':'arm64'}[platform.machine()]
     run(binary, 'run', '-test', '-config', '/usr/local/x-ui/bin/config.json',
         env=dict(os.environ, XRAY_LOCATION_ASSET='/usr/local/x-ui/bin'))
@@ -676,10 +847,10 @@ def bootstrap_db(c, username, password):
     write(CONF / 'api-token', match[1]+'\n')
 
 
-def preflight(args):
-    osinfo = Path('/etc/os-release').read_text()
-    if not re.search(r'^ID=debian$', osinfo, re.M) or not re.search(r'^VERSION_ID="?13"?$', osinfo, re.M):
-        raise ValueError('Only Debian 13 is supported')
+def preflight(args, required_version='13'):
+    osinfo = platform.freedesktop_os_release()
+    if osinfo.get('ID') != 'debian' or osinfo.get('VERSION_ID') != required_version:
+        raise ValueError('Only Debian ' + required_version + ' is supported')
     if BASE.exists() or CONF.exists() or APP.exists() or Path('/usr/local/x-ui').exists() or Path('/etc/x-ui').exists() or Path('/etc/nginx').exists():
         raise ValueError('Existing installation/configuration found; refusing overwrite')
     if args.panel in args.reality_name or args.site in args.reality_name or len(set(args.reality_name)) != len(args.reality_name):
@@ -712,7 +883,38 @@ def preflight(args):
     return ssh_ports, public
 
 
+def ensure_debian13(args):
+    osinfo = platform.freedesktop_os_release()
+    if osinfo.get('ID') == 'debian' and osinfo.get('VERSION_ID') == '13':
+        return True
+    if osinfo.get('ID') != 'debian' or osinfo.get('VERSION_ID') != '12':
+        raise ValueError('Automatic upgrade supports Debian 12 → 13 only. Older Debian must first be upgraded to 12; other distributions and downgrades are unsupported.')
+    # Check the installation prerequisites BEFORE offering a system upgrade.
+    preflight(args, required_version='12')
+    from importlib.util import module_from_spec, spec_from_file_location
+    spec = spec_from_file_location('debian_upgrade', Path(__file__).parent / 'helpers' / 'upgrade-debian.py')
+    helper = module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    helper.validate_upgrade()
+    if not args.upgrade_debian:
+        try:
+            with open('/dev/tty', 'r+') as tty:
+                tty.write('Обнаружен Debian 12. Обновить до Debian 13 автоматически?\n'
+                          'Будут обновлены пакеты, перезагружен VPS, затем продолжена установка панели.\n'
+                          'Перед продолжением сделайте снимок VPS у провайдера. Продолжить? [y/N]: ')
+                tty.flush()
+                answer = tty.readline().strip().lower()
+        except OSError:
+            raise ValueError('Debian 12 detected. Run install with --upgrade-debian to approve the upgrade, reboot and automatic installation in non-interactive mode.') from None
+        if answer not in ('y', 'yes', 'д', 'да'):
+            raise ValueError('Debian upgrade declined; system unchanged')
+    helper.schedule(vars(args), Path(__file__).parent)
+    return False
+
+
 def install(args):
+    if not ensure_debian13(args):
+        return
     ssh_ports, ips = preflight(args)
     r, asset = release()
     for path in (BASE, CONF):
@@ -788,7 +990,19 @@ WantedBy=timers.target
         shutil.copy2(APP / 'templates' / 'load-firewall.sh', CONF / 'load-firewall')
         (CONF / 'load-firewall').chmod(0o700)
         run('systemctl', 'daemon-reload')
-        run('systemctl', 'enable', '--now', 'proxy-stack-firewall.service', 'x-ui.service', 'proxy-stack-sync.timer', 'certbot.timer')
+        run('systemctl', 'enable', '--now', 'proxy-stack-firewall.service', 'x-ui.service', 'certbot.timer')
+        for attempt in range(30):
+            try:
+                panel_api(c, 'inbounds/list')
+                break
+            except Exception:
+                if attempt == 29:
+                    raise
+                time.sleep(1)
+        if not args.no_default_inbounds:
+            seed_default_inbounds(c)
+            run('systemctl', 'restart', 'x-ui.service')
+        run('systemctl', 'enable', '--now', 'proxy-stack-sync.timer')
         for attempt in range(15):
             try:
                 sync(c)
@@ -851,8 +1065,9 @@ def backup():
     with sqlite3.connect('/etc/x-ui/x-ui.db') as source, sqlite3.connect(dest / 'x-ui.db') as target:
         source.backup(target)
     shutil.copytree(CONF, dest / 'config')
-    if (BASE/'auto-setup.json').exists():
-        shutil.copy2(BASE/'auto-setup.json',dest/'auto-setup.json')
+    for name in ('auto-setup.json', 'default-inbounds.json'):
+        if (BASE/name).exists():
+            shutil.copy2(BASE/name, dest/name)
     shutil.copytree('/usr/local/x-ui', dest / 'x-ui')
     shutil.copy2(NGINX, dest / 'nginx.conf')
     shutil.copy2('/etc/systemd/system/x-ui.service', dest / 'x-ui.service')
@@ -874,10 +1089,11 @@ def restore(dest):
         Path('/etc/x-ui',name).unlink(missing_ok=True)
     shutil.copy2(dest / 'x-ui.db', '/etc/x-ui/x-ui.db')
     shutil.copytree(dest / 'config', CONF, dirs_exist_ok=True)
-    if (dest/'auto-setup.json').exists():
-        shutil.copy2(dest/'auto-setup.json',BASE/'auto-setup.json')
-    else:
-        (BASE/'auto-setup.json').unlink(missing_ok=True)
+    for name in ('auto-setup.json', 'default-inbounds.json'):
+        if (dest/name).exists():
+            shutil.copy2(dest/name, BASE/name)
+        else:
+            (BASE/name).unlink(missing_ok=True)
     shutil.copy2(dest / 'nginx.conf', NGINX)
     shutil.copy2(dest / 'x-ui.service', '/etc/systemd/system/x-ui.service')
     run('nginx','-t')
@@ -961,8 +1177,10 @@ def main():
     ins.add_argument('--email',default='')
     ins.add_argument('--reality-name',action='append',default=[],type=domain,help='Additional DNS name for independent REALITY on TCP 443; repeatable')
     ins.add_argument('--manual-inbounds',action='store_true',help='Disable automatic first-time setup of newly created VLESS inbounds')
+    ins.add_argument('--no-default-inbounds',action='store_true',help='Install an empty panel instead of seven ready-to-use connections')
+    ins.add_argument('--upgrade-debian',action='store_true',help='Approve Debian 12 → 13 upgrade, reboot and automatic installation without a prompt')
     ins.add_argument('--theme',choices=['astronomy','plants','photography','travel','cooking'])
-    for name in ('sync','status','doctor','backup','update','uninstall','purge'):
+    for name in ('sync','status','doctor','backup','update','uninstall','purge','seed-inbounds'):
         sub.add_parser(name)
     auto = sub.add_parser('auto-setup',help='Configure newly created VLESS inbounds once; existing profiles are preserved')
     auto.add_argument('mode',choices=['on','off'])
@@ -1014,6 +1232,9 @@ def main():
                 healthcheck(c)
         elif args.command == 'auto-setup':
             set_auto_setup(c,args.mode=='on')
+        elif args.command == 'seed-inbounds':
+            seed_default_inbounds(c)
+            sync(c)
         elif args.command == 'configure-inbound':
             items = panel_api(c,'inbounds/list')
             i = next((i for i in items if i['id']==args.id),None)
